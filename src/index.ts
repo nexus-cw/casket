@@ -24,6 +24,9 @@ export {
   CasketUnsupportedVersionError,
 } from './errors.js';
 
+export type { ChannelStorage, PairingToken, PeerRecord } from './channel.js';
+export { Channel, PairedChannel, ChannelPairError, ChannelVerifyError } from './channel.js';
+
 // Internal exports for testing (fixed-nonce sealing)
 export { sealPassword, unsealPassword, sealRawKey, unsealRawKey } from './internal/wire/blob.js';
 export { encode as base64UrlEncode, decode as base64UrlDecode } from './internal/base64url.js';
