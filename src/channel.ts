@@ -19,26 +19,39 @@ export interface ChannelStorage {
   delete(key: string): Promise<void>;
 }
 
-export type SigAlg = 'ed25519' | 'p256';
-
 export interface PairingToken {
   v: 1;
   nexus_id: string;
-  pubkey: string;     // base64url signing public key — 32B raw Ed25519 or 65B uncompressed P-256
-  sig_alg: SigAlg;   // signing algorithm used by the sender
-  dh_pubkey: string;  // base64url X25519/P-256 ECDH public key (65 bytes uncompressed)
-  endpoint: string;   // https URL of this frame's relay Worker
-  nonce: string;      // base64url 16 random bytes — OOB token replay guard
-  ts: number;         // unix seconds
+  sig_alg: 'ed25519';  // always ed25519 for TS; present for interchange cross-alg rejection
+  pubkey: string;      // base64url Ed25519 public key (32 bytes) — for sign/verify
+  dh_pubkey: string;   // base64url X25519 public key (32 bytes) — for ECDH
+  endpoint: string;    // https URL of this frame's relay Worker
+  nonce: string;       // base64url 16 random bytes — OOB token replay guard
+  ts: number;          // unix seconds
+}
+
+/**
+ * One half of a POST /pair/register body for the Interchange.
+ * Both sides submit their half in the same request.
+ * `self_sig` covers the canonical fields so the Interchange can verify
+ * possession of the private key before storing the pair.
+ */
+export interface InterchangeHalf {
+  nexus_id: string;
+  sig_alg: 'ed25519';
+  pubkey: string;    // base64url raw Ed25519 pubkey (32 bytes)
+  endpoint: string;
+  nonce: string;     // base64url 16 random bytes — fresh per registration
+  ts: string;        // ISO-8601 UTC — interchange replay window uses this
+  self_sig: string;  // base64url Ed25519 sig over canonical bytes
 }
 
 export interface PeerRecord {
   nexus_id: string;
-  pubkey: string;     // base64url signing public key
-  sig_alg: SigAlg;   // signing algorithm the peer uses
-  dh_pubkey: string;  // base64url P-256 ECDH (65 bytes uncompressed)
+  pubkey: string;     // base64url Ed25519
+  dh_pubkey: string;  // base64url X25519
   endpoint: string;
-  path_id: string;    // nxc_<base64url(sha256(sort(sigPubA, sigPubB)))>
+  path_id: string;    // nxc_<base64url(sha256(sort(ed25519_pubA, ed25519_pubB)))>
   paired_at: number;  // unix seconds
 }
 
@@ -110,18 +123,6 @@ async function deriveSharedKey(
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt'],
-  );
-}
-
-async function importPeerSigKey(pubBytes: Uint8Array, alg: SigAlg): Promise<CryptoKey> {
-  if (alg === 'p256') {
-    return crypto.subtle.importKey(
-      'raw', pubBytes.buffer as ArrayBuffer,
-      { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'],
-    );
-  }
-  return crypto.subtle.importKey(
-    'raw', pubBytes.buffer as ArrayBuffer, { name: 'Ed25519' }, false, ['verify'],
   );
 }
 
@@ -212,12 +213,48 @@ export class Channel {
     return {
       v: 1,
       nexus_id: this.nexusId,
+      sig_alg:   'ed25519',
       pubkey:    this.publicKeyB64u(),
-      sig_alg:  'ed25519',
       dh_pubkey: this.dhPublicKeyB64u(),
       endpoint,
       nonce: b64uEncode(randomBytes(16)),
       ts: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  /**
+   * Build an InterchangeHalf for POST /pair/register.
+   * Each side calls this independently and the operator assembles { a, b }.
+   *
+   * Canonical bytes (UTF-8, LF-joined, no trailing newline):
+   *   v1 / nexus_id / sig_alg / pubkey / endpoint / nonce / ts
+   * where ts is ISO-8601 UTC and endpoint is empty string if absent.
+   */
+  async toInterchangeHalf(endpoint = ''): Promise<InterchangeHalf> {
+    const nonce = b64uEncode(randomBytes(16));
+    const ts    = new Date().toISOString().replace(/\.\d+Z$/, 'Z');  // second precision
+    const canonical = [
+      'v1',
+      this.nexusId,
+      'ed25519',
+      this.publicKeyB64u(),
+      endpoint,
+      nonce,
+      ts,
+    ].join('\n');
+    const sigBytes = await crypto.subtle.sign(
+      'Ed25519',
+      this.sigPrivateKey,
+      new TextEncoder().encode(canonical).buffer as ArrayBuffer,
+    );
+    return {
+      nexus_id: this.nexusId,
+      sig_alg:  'ed25519',
+      pubkey:   this.publicKeyB64u(),
+      endpoint,
+      nonce,
+      ts,
+      self_sig: b64uEncode(new Uint8Array(sigBytes)),
     };
   }
 
@@ -231,18 +268,15 @@ export class Channel {
       throw new ChannelPairError(`Pairing token is too old or from the future (age=${age}s).`);
     }
 
-    const peerSigAlg: SigAlg = token.sig_alg ?? 'ed25519';
     const peerSigPubBytes = b64uDecode(token.pubkey);
-    if (peerSigAlg === 'ed25519' && peerSigPubBytes.length !== 32) {
+    if (peerSigPubBytes.length !== 32) {
       throw new ChannelPairError('Peer Ed25519 public key must be 32 bytes.');
-    }
-    if (peerSigAlg === 'p256' && peerSigPubBytes.length !== 65) {
-      throw new ChannelPairError('Peer P-256 signing public key must be 65 bytes (uncompressed).');
     }
 
     const peerDhPubBytes = b64uDecode(token.dh_pubkey);
+    // P-256 uncompressed public key = 65 bytes (0x04 + 32 + 32)
     if (peerDhPubBytes.length !== 65) {
-      throw new ChannelPairError('Peer ECDH public key must be 65 bytes (uncompressed P-256).');
+      throw new ChannelPairError('Peer X25519 (P-256) public key must be 65 bytes.');
     }
 
     const pathId = await computePathId(this._sigPublicKeyBytes, peerSigPubBytes);
@@ -251,7 +285,6 @@ export class Channel {
     const record: PeerRecord = {
       nexus_id:  token.nexus_id,
       pubkey:    token.pubkey,
-      sig_alg:   peerSigAlg,
       dh_pubkey: token.dh_pubkey,
       endpoint:  token.endpoint,
       path_id:   pathId,
@@ -259,8 +292,10 @@ export class Channel {
     };
     await this.storage.put(`${PEER_KEY_PREFIX}${token.nexus_id}`, JSON.stringify(record));
 
-    const peerSigPublicKey = await importPeerSigKey(peerSigPubBytes, peerSigAlg);
-    return new PairedChannel(this.nexusId, this.sigPrivateKey, record, peerSigPublicKey, sharedKey, peerSigAlg);
+    const peerSigPublicKey = await crypto.subtle.importKey(
+      'raw', peerSigPubBytes.buffer as ArrayBuffer, { name: 'Ed25519' }, false, ['verify'],
+    );
+    return new PairedChannel(this.nexusId, this.sigPrivateKey, record, peerSigPublicKey, sharedKey);
   }
 
   /** Reload an existing PairedChannel from storage. Returns null if not paired. */
@@ -269,14 +304,15 @@ export class Channel {
     if (!raw) return null;
     const record = JSON.parse(raw) as PeerRecord;
 
-    const peerSigAlg: SigAlg = record.sig_alg ?? 'ed25519';
     const peerSigPubBytes = b64uDecode(record.pubkey);
     const peerDhPubBytes  = b64uDecode(record.dh_pubkey);
 
-    const peerSigPublicKey = await importPeerSigKey(peerSigPubBytes, peerSigAlg);
+    const peerSigPublicKey = await crypto.subtle.importKey(
+      'raw', peerSigPubBytes.buffer as ArrayBuffer, { name: 'Ed25519' }, false, ['verify'],
+    );
     const sharedKey = await deriveSharedKey(this.dhPrivateKey, peerDhPubBytes);
 
-    return new PairedChannel(this.nexusId, this.sigPrivateKey, record, peerSigPublicKey, sharedKey, peerSigAlg);
+    return new PairedChannel(this.nexusId, this.sigPrivateKey, record, peerSigPublicKey, sharedKey);
   }
 
   /** Remove a peer. Fresh pair() after revocation produces a new pathId. */
@@ -296,7 +332,6 @@ export class PairedChannel {
     private readonly peer: PeerRecord,
     private readonly peerSigPublicKey: CryptoKey,
     private readonly sharedKey: CryptoKey,
-    private readonly peerSigAlg: SigAlg = 'ed25519',
   ) {}
 
   /** Symmetric path identifier — use as interchange mailbox address / DO name. */
@@ -323,11 +358,8 @@ export class PairedChannel {
    */
   async verify(signatureB64u: string, data: Uint8Array): Promise<void> {
     const sigBytes = b64uDecode(signatureB64u);
-    const algorithm = this.peerSigAlg === 'p256'
-      ? { name: 'ECDSA', hash: 'SHA-256' }
-      : 'Ed25519';
     const valid = await crypto.subtle.verify(
-      algorithm, this.peerSigPublicKey,
+      'Ed25519', this.peerSigPublicKey,
       sigBytes.buffer as ArrayBuffer,
       data.buffer as ArrayBuffer,
     );
