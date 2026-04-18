@@ -1,6 +1,13 @@
 import { describe, it, expect } from '@jest/globals';
 import { Channel, ChannelPairError, ChannelVerifyError, ChannelDecryptError } from '../src/channel.js';
-import type { ChannelStorage } from '../src/channel.js';
+import type { ChannelStorage, InterchangeHalf } from '../src/channel.js';
+
+function b64uDecode(s: string): Uint8Array {
+  const p = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = p.length % 4;
+  const padded = pad === 2 ? p + '==' : pad === 3 ? p + '=' : p;
+  return new Uint8Array(Buffer.from(padded, 'base64'));
+}
 
 function makeStorage(): ChannelStorage {
   const store = new Map<string, string>();
@@ -95,6 +102,7 @@ describe('Channel', () => {
       const badToken = {
         v: 1 as const,
         nexus_id: 'nexus-b',
+        sig_alg: 'ed25519' as const,
         pubkey: 'aGVsbG8',  // "hello" — not 32 bytes
         dh_pubkey: 'aGVsbG8',
         endpoint: 'https://x.workers.dev',
@@ -220,6 +228,77 @@ describe('Channel', () => {
     it('decryptBody throws on input that is too short', async () => {
       const { pairedB } = await makePairedChannels();
       await expect(pairedB.decryptBody('YWJj')).rejects.toThrow(ChannelDecryptError);
+    });
+  });
+
+  describe('toInterchangeHalf', () => {
+    it('returns required fields in correct shape', async () => {
+      const ch = await Channel.load('nexus-a', makeStorage());
+      const half = await ch.toInterchangeHalf('https://relay.workers.dev');
+      expect(half.nexus_id).toBe('nexus-a');
+      expect(half.sig_alg).toBe('ed25519');
+      expect(half.pubkey).toBe(ch.publicKeyB64u());
+      expect(half.endpoint).toBe('https://relay.workers.dev');
+      expect(half.nonce).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(half.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+      expect(half.self_sig).toMatch(/^[A-Za-z0-9_-]+$/);
+    });
+
+    it('self_sig verifies against the pubkey in the half', async () => {
+      const ch = await Channel.load('nexus-a', makeStorage());
+      const half = await ch.toInterchangeHalf('https://relay.workers.dev');
+
+      const canonical = [
+        'v1', half.nexus_id, half.sig_alg, half.pubkey,
+        half.endpoint, half.nonce, half.ts,
+      ].join('\n');
+      const pubKey = await crypto.subtle.importKey(
+        'raw', b64uDecode(half.pubkey).buffer as ArrayBuffer, { name: 'Ed25519' }, false, ['verify'],
+      );
+      const ok = await crypto.subtle.verify(
+        'Ed25519', pubKey,
+        b64uDecode(half.self_sig).buffer as ArrayBuffer,
+        new TextEncoder().encode(canonical).buffer as ArrayBuffer,
+      );
+      expect(ok).toBe(true);
+    });
+
+    it('self_sig fails verification if canonical field is tampered', async () => {
+      const ch = await Channel.load('nexus-a', makeStorage());
+      const half = await ch.toInterchangeHalf('https://relay.workers.dev');
+
+      const tampered = [
+        'v1', 'tampered-nexus-id', half.sig_alg, half.pubkey,
+        half.endpoint, half.nonce, half.ts,
+      ].join('\n');
+      const pubKey = await crypto.subtle.importKey(
+        'raw', b64uDecode(half.pubkey).buffer as ArrayBuffer, { name: 'Ed25519' }, false, ['verify'],
+      );
+      const ok = await crypto.subtle.verify(
+        'Ed25519', pubKey,
+        b64uDecode(half.self_sig).buffer as ArrayBuffer,
+        new TextEncoder().encode(tampered).buffer as ArrayBuffer,
+      );
+      expect(ok).toBe(false);
+    });
+
+    it('each call produces a unique nonce', async () => {
+      const ch = await Channel.load('nexus-a', makeStorage());
+      const h1 = await ch.toInterchangeHalf('https://relay.workers.dev');
+      const h2 = await ch.toInterchangeHalf('https://relay.workers.dev');
+      expect(h1.nonce).not.toBe(h2.nonce);
+    });
+
+    it('empty endpoint defaults to empty string', async () => {
+      const ch = await Channel.load('nexus-a', makeStorage());
+      const half = await ch.toInterchangeHalf();
+      expect(half.endpoint).toBe('');
+    });
+
+    it('makePairingToken includes sig_alg field', async () => {
+      const ch = await Channel.load('nexus-a', makeStorage());
+      const token = ch.makePairingToken('https://relay.workers.dev');
+      expect(token.sig_alg).toBe('ed25519');
     });
   });
 });

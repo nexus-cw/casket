@@ -24,7 +24,7 @@ export {
   CasketUnsupportedVersionError,
 } from './errors.js';
 
-export type { ChannelStorage, PairingToken, PeerRecord } from './channel.js';
+export type { ChannelStorage, PairingToken, PeerRecord, InterchangeHalf } from './channel.js';
 export { Channel, PairedChannel, ChannelPairError, ChannelVerifyError, ChannelDecryptError } from './channel.js';
 
 // Internal exports for testing (fixed-nonce sealing)
