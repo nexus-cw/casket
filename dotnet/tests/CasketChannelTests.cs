@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.Text;
 using System.Threading.Tasks;
 using Xunit;
+#if NET6_0_OR_GREATER
+using NSec.Cryptography;
+#endif
 
 namespace Casket.Tests;
 
@@ -456,6 +459,105 @@ public class CasketChannelTests
         byte[] raw = CasketChannel.ExportEcdhPublicKeyRaw(ecdh);
         Assert.Equal(65, raw.Length);
         Assert.Equal(0x04, raw[0]);
+    }
+
+    // ── ToInterchangeHalfAsync ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ToInterchangeHalfAsync_ReturnsRequiredFields()
+    {
+        using var ch = await CasketChannel.LoadAsync("nexus-x", new MemoryStorage());
+        var half = await ch.ToInterchangeHalfAsync("https://relay.workers.dev");
+        Assert.Equal("nexus-x", half.NexusId);
+        Assert.Equal(CasketChannel.SigAlgId, half.SigAlg);
+        Assert.Equal(ch.PublicKeyB64u, half.Pubkey);
+        Assert.Equal("https://relay.workers.dev", half.Endpoint);
+        Assert.NotEmpty(half.Nonce);
+        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", half.Ts);
+        Assert.NotEmpty(half.SelfSig);
+    }
+
+    [Fact]
+    public async Task ToInterchangeHalfAsync_EmptyEndpointDefault()
+    {
+        using var ch = await CasketChannel.LoadAsync("nexus-x", new MemoryStorage());
+        var half = await ch.ToInterchangeHalfAsync();
+        Assert.Equal("", half.Endpoint);
+    }
+
+    [Fact]
+    public async Task ToInterchangeHalfAsync_UniqueNoncePerCall()
+    {
+        using var ch = await CasketChannel.LoadAsync("nexus-x", new MemoryStorage());
+        var h1 = await ch.ToInterchangeHalfAsync("https://relay.workers.dev");
+        var h2 = await ch.ToInterchangeHalfAsync("https://relay.workers.dev");
+        Assert.NotEqual(h1.Nonce, h2.Nonce);
+    }
+
+    [Fact]
+    public async Task ToInterchangeHalfAsync_SelfSigVerifiesAgainstPubkey()
+    {
+        using var ch = await CasketChannel.LoadAsync("nexus-x", new MemoryStorage());
+        var half = await ch.ToInterchangeHalfAsync("https://relay.workers.dev");
+
+        string canonical = string.Join("\n", new[]
+        {
+            "v1", half.NexusId, half.SigAlg, half.Pubkey,
+            half.Endpoint, half.Nonce, half.Ts,
+        });
+        byte[] canonicalBytes = Encoding.UTF8.GetBytes(canonical);
+        byte[] sig = CasketChannel.B64uDecode(half.SelfSig);
+        byte[] pubBytes = CasketChannel.B64uDecode(half.Pubkey);
+
+#if NET6_0_OR_GREATER
+        var ed25519 = NSec.Cryptography.SignatureAlgorithm.Ed25519;
+        var pubKey = NSec.Cryptography.PublicKey.Import(
+            ed25519, pubBytes, NSec.Cryptography.KeyBlobFormat.RawPublicKey);
+        bool ok = ed25519.Verify(pubKey, canonicalBytes, sig);
+#else
+        bool ok;
+        using (var ecdsa = System.Security.Cryptography.ECDsa.Create(
+            System.Security.Cryptography.ECCurve.NamedCurves.nistP256))
+        {
+            ecdsa.ImportSubjectPublicKeyInfo(pubBytes, out _);
+            ok = ecdsa.VerifyData(canonicalBytes,
+                sig, System.Security.Cryptography.HashAlgorithmName.SHA256);
+        }
+#endif
+        Assert.True(ok);
+    }
+
+    [Fact]
+    public async Task ToInterchangeHalfAsync_SelfSigFailsIfTampered()
+    {
+        using var ch = await CasketChannel.LoadAsync("nexus-x", new MemoryStorage());
+        var half = await ch.ToInterchangeHalfAsync("https://relay.workers.dev");
+
+        string tampered = string.Join("\n", new[]
+        {
+            "v1", "tampered-nexus-id", half.SigAlg, half.Pubkey,
+            half.Endpoint, half.Nonce, half.Ts,
+        });
+        byte[] tamperedBytes = Encoding.UTF8.GetBytes(tampered);
+        byte[] sig = CasketChannel.B64uDecode(half.SelfSig);
+        byte[] pubBytes = CasketChannel.B64uDecode(half.Pubkey);
+
+#if NET6_0_OR_GREATER
+        var ed25519 = NSec.Cryptography.SignatureAlgorithm.Ed25519;
+        var pubKey = NSec.Cryptography.PublicKey.Import(
+            ed25519, pubBytes, NSec.Cryptography.KeyBlobFormat.RawPublicKey);
+        bool ok = ed25519.Verify(pubKey, tamperedBytes, sig);
+#else
+        bool ok;
+        using (var ecdsa = System.Security.Cryptography.ECDsa.Create(
+            System.Security.Cryptography.ECCurve.NamedCurves.nistP256))
+        {
+            ecdsa.ImportSubjectPublicKeyInfo(pubBytes, out _);
+            ok = ecdsa.VerifyData(tamperedBytes,
+                sig, System.Security.Cryptography.HashAlgorithmName.SHA256);
+        }
+#endif
+        Assert.False(ok);
     }
 
     // ── B64u helpers ──────────────────────────────────────────────────────────
