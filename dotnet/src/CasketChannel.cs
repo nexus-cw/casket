@@ -4,6 +4,9 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+#if NET6_0_OR_GREATER
+using NSec.Cryptography;
+#endif
 
 namespace Casket;
 
@@ -16,8 +19,10 @@ public sealed class CasketPairingToken
 {
     public int V { get; init; } = 1;
     public string NexusId { get; init; } = "";
-    /// <summary>base64url SubjectPublicKeyInfo of the signing key (Ed25519 on .NET 8+, P-256 on netstandard2.1).</summary>
+    /// <summary>base64url public key: 32-byte Ed25519 raw key on .NET 6+, SPKI P-256 on netstandard2.1.</summary>
     public string Pubkey { get; init; } = "";
+    /// <summary>Signing algorithm: "ed25519" on .NET 6+, "p256" on netstandard2.1.</summary>
+    public string SigAlg { get; init; } = "";
     /// <summary>base64url uncompressed ECDH P-256 public key (65 bytes: 0x04 || X || Y).</summary>
     public string DhPubkey { get; init; } = "";
     public string Endpoint { get; init; } = "";
@@ -30,6 +35,7 @@ public sealed class CasketPeerRecord
 {
     public string NexusId { get; init; } = "";
     public string Pubkey { get; init; } = "";
+    public string SigAlg { get; init; } = "";
     public string DhPubkey { get; init; } = "";
     public string Endpoint { get; init; } = "";
     public string PathId { get; init; } = "";
@@ -49,9 +55,9 @@ public sealed class CasketChannel : IDisposable
     private const string PeerPrefix = "casket:peers:";
 
     private readonly string _nexusId;
-    private readonly byte[] _sigPrivateKeyBytes;  // PKCS8
-    private readonly byte[] _sigPublicKeyBytes;   // SPKI
-    private readonly byte[] _dhPrivateKeyBytes;   // PKCS8
+    private readonly byte[] _sigPrivateKeyBytes;  // Ed25519 seed (32B) on .NET 6+, PKCS8 P-256 on netstandard2.1
+    private readonly byte[] _sigPublicKeyBytes;   // Ed25519 raw pub (32B) on .NET 6+, SPKI P-256 on netstandard2.1
+    private readonly byte[] _dhPrivateKeyBytes;   // PKCS8 P-256
     private readonly byte[] _dhPublicKeyBytes;    // raw 65-byte uncompressed P-256
     private readonly ICasketChannelStorage _storage;
     private bool _disposed;
@@ -90,11 +96,20 @@ public sealed class CasketChannel : IDisposable
 
         // First run — generate both keypairs.
         byte[] sigPriv, sigPub;
+#if NET6_0_OR_GREATER
+        var ed25519 = SignatureAlgorithm.Ed25519;
+        using (var sigKey = Key.Create(ed25519, new KeyCreationParameters { ExportPolicy = KeyExportPolicies.AllowPlaintextExport }))
+        {
+            sigPriv = sigKey.Export(KeyBlobFormat.RawPrivateKey);
+            sigPub  = sigKey.PublicKey.Export(KeyBlobFormat.RawPublicKey);
+        }
+#else
         using (var ecdsa = CreateSigningKey())
         {
             sigPriv = ecdsa.ExportPkcs8PrivateKey();
             sigPub  = ecdsa.ExportSubjectPublicKeyInfo();
         }
+#endif
 
         byte[] dhPriv, dhPubRaw;
         using (var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256))
@@ -114,6 +129,11 @@ public sealed class CasketChannel : IDisposable
     public string NexusId        => _nexusId;
     public string PublicKeyB64u  => B64uEncode(_sigPublicKeyBytes);
     public string DhPublicKeyB64u => B64uEncode(_dhPublicKeyBytes);
+#if NET6_0_OR_GREATER
+    public const string SigAlgId = "ed25519";
+#else
+    public const string SigAlgId = "p256";
+#endif
 
     public CasketPairingToken MakePairingToken(string endpoint)
     {
@@ -124,6 +144,7 @@ public sealed class CasketChannel : IDisposable
             V        = 1,
             NexusId  = _nexusId,
             Pubkey   = PublicKeyB64u,
+            SigAlg   = SigAlgId,
             DhPubkey = DhPublicKeyB64u,
             Endpoint = endpoint,
             Nonce    = B64uEncode(nonce),
@@ -165,6 +186,7 @@ public sealed class CasketChannel : IDisposable
         {
             NexusId  = token.NexusId,
             Pubkey   = token.Pubkey,
+            SigAlg   = token.SigAlg,
             DhPubkey = token.DhPubkey,
             Endpoint = token.Endpoint,
             PathId   = pathId,
@@ -194,14 +216,12 @@ public sealed class CasketChannel : IDisposable
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    // Ed25519 via ECDsa.Create(curve) is not supported by the Windows CNG
-    // provider at runtime even on .NET 8+. Use P-256 uniformly across all
-    // targets. Cross-platform wire compatibility with the TypeScript channel
-    // (which uses Ed25519 via WebCrypto) is NOT guaranteed for the signature
-    // layer — a future version will unify both sides once .NET ships a
-    // first-class Ed25519 sign/verify API on all platforms.
+    // netstandard2.1 fallback only — Ed25519 CNG gap means P-256 is used there.
+    // On .NET 6+ we use NSec.Cryptography (libsodium) for Ed25519.
+#if !NET6_0_OR_GREATER
     private static ECDsa CreateSigningKey()
         => ECDsa.Create(ECCurve.NamedCurves.nistP256);
+#endif
 
     private static byte[] DeriveSharedKey(byte[] dhPrivBytes, byte[] peerDhPubRaw)
     {
@@ -345,8 +365,14 @@ public sealed class CasketPairedChannel : IDisposable
     /// </summary>
     public string Sign(ReadOnlySpan<byte> data)
     {
+#if NET6_0_OR_GREATER
+        var ed25519 = SignatureAlgorithm.Ed25519;
+        using var sigKey = Key.Import(ed25519, _sigPrivateKeyBytes, KeyBlobFormat.RawPrivateKey);
+        byte[] sig = ed25519.Sign(sigKey, data);
+#else
         using var ecdsa = CreateAndImportSigning(_sigPrivateKeyBytes);
         byte[] sig = ecdsa.SignData(data.ToArray(), HashAlgorithmName.SHA256);
+#endif
         return CasketChannel.B64uEncode(sig);
     }
 
@@ -358,8 +384,14 @@ public sealed class CasketPairedChannel : IDisposable
     {
         byte[] sig     = CasketChannel.B64uDecode(signatureB64u);
         byte[] peerPub = CasketChannel.B64uDecode(_peer.Pubkey);
+#if NET6_0_OR_GREATER
+        var ed25519 = SignatureAlgorithm.Ed25519;
+        var pubKey = PublicKey.Import(ed25519, peerPub, KeyBlobFormat.RawPublicKey);
+        bool valid = ed25519.Verify(pubKey, data, sig);
+#else
         using var ecdsa = ImportVerifyKey(peerPub);
         bool valid = ecdsa.VerifyData(data.ToArray(), sig, HashAlgorithmName.SHA256);
+#endif
         if (!valid) throw new CasketChannelVerifyException();
     }
 
@@ -428,6 +460,7 @@ public sealed class CasketPairedChannel : IDisposable
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+#if !NET6_0_OR_GREATER
     private static ECDsa CreateAndImportSigning(byte[] pkcs8)
     {
         var key = ECDsa.Create(ECCurve.NamedCurves.nistP256)!;
@@ -441,6 +474,7 @@ public sealed class CasketPairedChannel : IDisposable
         key.ImportSubjectPublicKeyInfo(spki, out _);
         return key;
     }
+#endif
 }
 
 [System.Text.Json.Serialization.JsonSerializable(typeof(CasketPairingToken))]
