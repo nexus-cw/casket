@@ -53,6 +53,7 @@ describe('Channel', () => {
     expect(token.v).toBe(1);
     expect(token.nexus_id).toBe('nexus-a');
     expect(token.pubkey).toBe(ch.publicKeyB64u());
+    expect(token.sig_alg).toBe('ed25519');
     expect(token.dh_pubkey).toBe(ch.dhPublicKeyB64u());
     expect(token.endpoint).toBe('https://relay-a.workers.dev');
     expect(token.nonce.length).toBeGreaterThan(0);
@@ -96,6 +97,7 @@ describe('Channel', () => {
         v: 1 as const,
         nexus_id: 'nexus-b',
         pubkey: 'aGVsbG8',  // "hello" — not 32 bytes
+        sig_alg: 'ed25519' as const,
         dh_pubkey: 'aGVsbG8',
         endpoint: 'https://x.workers.dev',
         nonce: 'abc',
