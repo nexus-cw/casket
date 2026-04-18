@@ -2,3 +2,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 .env
+
+# .NET build artifacts
+dotnet/**/bin/
+dotnet/**/obj/
+*.nupkg
+*.snupkg
+.vs/
