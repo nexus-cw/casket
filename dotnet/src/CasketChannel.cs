@@ -30,24 +30,6 @@ public sealed class CasketPairingToken
     public long Ts { get; init; }
 }
 
-/// <summary>
-/// One half of a POST /pair/register body for the Interchange.
-/// Build with <see cref="CasketChannel.ToInterchangeHalfAsync"/>.
-/// Assemble { "a": halfA, "b": halfB } and POST to the Interchange.
-/// </summary>
-public sealed class CasketInterchangeHalf
-{
-    public string NexusId { get; init; } = "";
-    public string SigAlg  { get; init; } = "";
-    public string Pubkey  { get; init; } = "";
-    public string Endpoint { get; init; } = "";
-    public string Nonce   { get; init; } = "";
-    /// <summary>ISO-8601 UTC timestamp (second precision).</summary>
-    public string Ts      { get; init; } = "";
-    /// <summary>base64url self-signature over canonical bytes.</summary>
-    public string SelfSig { get; init; } = "";
-}
-
 /// <summary>Stored record for a paired peer.</summary>
 public sealed class CasketPeerRecord
 {
@@ -168,55 +150,6 @@ public sealed class CasketChannel : IDisposable
             Nonce    = B64uEncode(nonce),
             Ts       = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
         };
-    }
-
-    /// <summary>
-    /// Build a <see cref="CasketInterchangeHalf"/> for POST /pair/register.
-    /// Canonical bytes (UTF-8, LF-joined, no trailing newline):
-    ///   v1 / nexus_id / sig_alg / pubkey / endpoint / nonce / ts (ISO-8601).
-    /// </summary>
-    public ValueTask<CasketInterchangeHalf> ToInterchangeHalfAsync(
-        string endpoint = "",
-        CancellationToken cancellationToken = default)
-    {
-        _ = cancellationToken;  // sync on all paths; kept for API consistency
-
-        byte[] nonceBytes = new byte[16];
-        RandomNumberGenerator.Fill(nonceBytes);
-        string nonce = B64uEncode(nonceBytes);
-        string ts    = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
-
-        string canonical = string.Join("\n", new[]
-        {
-            "v1", _nexusId, SigAlgId, PublicKeyB64u, endpoint, nonce, ts
-        });
-        byte[] canonicalBytes = Encoding.UTF8.GetBytes(canonical);
-
-#if NET6_0_OR_GREATER
-        var ed25519 = NSec.Cryptography.SignatureAlgorithm.Ed25519;
-        using var sigKey = NSec.Cryptography.Key.Import(
-            ed25519, _sigPrivateKeyBytes, NSec.Cryptography.KeyBlobFormat.RawPrivateKey);
-        byte[] sig = ed25519.Sign(sigKey, canonicalBytes);
-#else
-        byte[] sig;
-        using (var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256))
-        {
-            ecdsa.ImportPkcs8PrivateKey(_sigPrivateKeyBytes, out _);
-            sig = ecdsa.SignData(canonicalBytes, HashAlgorithmName.SHA256);
-        }
-#endif
-
-        var half = new CasketInterchangeHalf
-        {
-            NexusId  = _nexusId,
-            SigAlg   = SigAlgId,
-            Pubkey   = PublicKeyB64u,
-            Endpoint = endpoint,
-            Nonce    = nonce,
-            Ts       = ts,
-            SelfSig  = B64uEncode(sig),
-        };
-        return new ValueTask<CasketInterchangeHalf>(half);
     }
 
     public static string SerializePairingToken(CasketPairingToken token)
@@ -546,7 +479,6 @@ public sealed class CasketPairedChannel : IDisposable
 
 [System.Text.Json.Serialization.JsonSerializable(typeof(CasketPairingToken))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(CasketPeerRecord))]
-[System.Text.Json.Serialization.JsonSerializable(typeof(CasketInterchangeHalf))]
 [System.Text.Json.Serialization.JsonSourceGenerationOptions(
     PropertyNamingPolicy = System.Text.Json.Serialization.JsonKnownNamingPolicy.SnakeCaseLower)]
 internal partial class CasketChannelJsonContext : System.Text.Json.Serialization.JsonSerializerContext { }

@@ -30,22 +30,6 @@ export interface PairingToken {
   ts: number;          // unix seconds
 }
 
-/**
- * One half of a POST /pair/register body for the Interchange.
- * Both sides submit their half in the same request.
- * `self_sig` covers the canonical fields so the Interchange can verify
- * possession of the private key before storing the pair.
- */
-export interface InterchangeHalf {
-  nexus_id: string;
-  sig_alg: 'ed25519';
-  pubkey: string;    // base64url raw Ed25519 pubkey (32 bytes)
-  endpoint: string;
-  nonce: string;     // base64url 16 random bytes — fresh per registration
-  ts: string;        // ISO-8601 UTC — interchange replay window uses this
-  self_sig: string;  // base64url Ed25519 sig over canonical bytes
-}
-
 export interface PeerRecord {
   nexus_id: string;
   pubkey: string;     // base64url Ed25519
@@ -219,42 +203,6 @@ export class Channel {
       endpoint,
       nonce: b64uEncode(randomBytes(16)),
       ts: Math.floor(Date.now() / 1000),
-    };
-  }
-
-  /**
-   * Build an InterchangeHalf for POST /pair/register.
-   * Each side calls this independently and the operator assembles { a, b }.
-   *
-   * Canonical bytes (UTF-8, LF-joined, no trailing newline):
-   *   v1 / nexus_id / sig_alg / pubkey / endpoint / nonce / ts
-   * where ts is ISO-8601 UTC and endpoint is empty string if absent.
-   */
-  async toInterchangeHalf(endpoint = ''): Promise<InterchangeHalf> {
-    const nonce = b64uEncode(randomBytes(16));
-    const ts    = new Date().toISOString().replace(/\.\d+Z$/, 'Z');  // second precision
-    const canonical = [
-      'v1',
-      this.nexusId,
-      'ed25519',
-      this.publicKeyB64u(),
-      endpoint,
-      nonce,
-      ts,
-    ].join('\n');
-    const sigBytes = await crypto.subtle.sign(
-      'Ed25519',
-      this.sigPrivateKey,
-      new TextEncoder().encode(canonical).buffer as ArrayBuffer,
-    );
-    return {
-      nexus_id: this.nexusId,
-      sig_alg:  'ed25519',
-      pubkey:   this.publicKeyB64u(),
-      endpoint,
-      nonce,
-      ts,
-      self_sig: b64uEncode(new Uint8Array(sigBytes)),
     };
   }
 
