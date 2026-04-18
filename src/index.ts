@@ -25,7 +25,7 @@ export {
 } from './errors.js';
 
 export type { ChannelStorage, PairingToken, PeerRecord } from './channel.js';
-export { Channel, PairedChannel, ChannelPairError, ChannelVerifyError } from './channel.js';
+export { Channel, PairedChannel, ChannelPairError, ChannelVerifyError, ChannelDecryptError } from './channel.js';
 
 // Internal exports for testing (fixed-nonce sealing)
 export { sealPassword, unsealPassword, sealRawKey, unsealRawKey } from './internal/wire/blob.js';

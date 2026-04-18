@@ -1,12 +1,13 @@
 {
   "name": "@nexus-cw/casket",
-  "version": "0.1.0-alpha",
-  "description": "Small, easy-to-use authenticated encryption library for Node.js. AES-256-GCM and ChaCha20-Poly1305 with Argon2id key derivation. Cross-compatible wire format with Casket (.NET).",
+  "version": "0.1.0",
+  "description": "Authenticated encryption and Ed25519 channel identity for Node.js and Cloudflare Workers. AES-256-GCM and ChaCha20-Poly1305 with Argon2id KDF. Cross-compatible wire format with Casket (.NET).",
   "license": "MIT",
   "author": "dMonGirl",
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
   "exports": {
     ".": {
       "import": "./dist/esm/index.js",
@@ -14,10 +15,36 @@
       "types": "./dist/esm/index.d.ts"
     }
   },
+  "files": [
+    "dist/",
+    "src/",
+    "LICENSE"
+  ],
+  "keywords": [
+    "encryption",
+    "aes-gcm",
+    "chacha20",
+    "argon2",
+    "ed25519",
+    "webcrypto",
+    "cloudflare-workers",
+    "authenticated-encryption",
+    "key-exchange"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nexus-cw/casket.git"
+  },
+  "homepage": "https://github.com/nexus-cw/casket#readme",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json",
+    "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-pkg.js",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --testPathPattern=tests/",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test"
   },
   "engines": { "node": ">=18.0.0" },
   "dependencies": {

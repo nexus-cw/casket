@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from '@jest/globals';
-import { Channel, ChannelPairError, ChannelVerifyError } from '../src/channel.js';
+import { describe, it, expect } from '@jest/globals';
+import { Channel, ChannelPairError, ChannelVerifyError, ChannelDecryptError } from '../src/channel.js';
 import type { ChannelStorage } from '../src/channel.js';
 
 function makeStorage(): ChannelStorage {
@@ -11,50 +11,57 @@ function makeStorage(): ChannelStorage {
   };
 }
 
+async function makePairedChannels() {
+  const storA = makeStorage();
+  const storB = makeStorage();
+  const chA = await Channel.load('nexus-a', storA);
+  const chB = await Channel.load('nexus-b', storB);
+  const tokenA = chA.makePairingToken('https://relay-a.workers.dev');
+  const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
+  const pairedA = await chA.pair(tokenB);
+  const pairedB = await chB.pair(tokenA);
+  return { chA, chB, storA, storB, pairedA, pairedB };
+}
+
 describe('Channel', () => {
-  it('generates a keypair on first load', async () => {
+  it('generates Ed25519 and X25519 keypairs on first load', async () => {
     const storage = makeStorage();
     const ch = await Channel.load('nexus-a', storage);
     expect(ch.publicKeyBytes().length).toBe(32);
     expect(ch.publicKeyB64u()).toMatch(/^[A-Za-z0-9_-]+$/);
+    // P-256 uncompressed = 65 bytes
+    expect(ch.dhPublicKeyBytes().length).toBe(65);
+    expect(ch.dhPublicKeyB64u()).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 
-  it('reloads the same keypair from storage', async () => {
+  it('reloads the same keypairs from storage', async () => {
     const storage = makeStorage();
     const ch1 = await Channel.load('nexus-a', storage);
-    const pub1 = ch1.publicKeyB64u();
+    const pub1   = ch1.publicKeyB64u();
+    const dhPub1 = ch1.dhPublicKeyB64u();
 
     const ch2 = await Channel.load('nexus-a', storage);
     expect(ch2.publicKeyB64u()).toBe(pub1);
+    expect(ch2.dhPublicKeyB64u()).toBe(dhPub1);
   });
 
-  it('makePairingToken returns a well-formed token', async () => {
+  it('makePairingToken includes both pubkeys', async () => {
     const storage = makeStorage();
     const ch = await Channel.load('nexus-a', storage);
-    const token = ch.makePairingToken('https://relay.nexus-a.workers.dev');
+    const token = ch.makePairingToken('https://relay-a.workers.dev');
 
     expect(token.v).toBe(1);
     expect(token.nexus_id).toBe('nexus-a');
     expect(token.pubkey).toBe(ch.publicKeyB64u());
-    expect(token.endpoint).toBe('https://relay.nexus-a.workers.dev');
+    expect(token.dh_pubkey).toBe(ch.dhPublicKeyB64u());
+    expect(token.endpoint).toBe('https://relay-a.workers.dev');
     expect(token.nonce.length).toBeGreaterThan(0);
     expect(token.ts).toBeGreaterThan(0);
   });
 
   describe('pair()', () => {
     it('produces a PairedChannel with a consistent path ID', async () => {
-      const storA = makeStorage();
-      const storB = makeStorage();
-      const chA = await Channel.load('nexus-a', storA);
-      const chB = await Channel.load('nexus-b', storB);
-
-      const tokenA = chA.makePairingToken('https://relay-a.workers.dev');
-      const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
-
-      const pairedA = await chA.pair(tokenB);
-      const pairedB = await chB.pair(tokenA);
-
-      // Both sides must compute the same path ID.
+      const { pairedA, pairedB } = await makePairedChannels();
       expect(pairedA.pathId()).toBe(pairedB.pathId());
       expect(pairedA.pathId()).toMatch(/^nxc_[A-Za-z0-9_-]+$/);
     });
@@ -64,13 +71,11 @@ describe('Channel', () => {
       const storB = makeStorage();
       const chA = await Channel.load('nexus-a', storA);
       const chB = await Channel.load('nexus-b', storB);
-
       const tokenA = chA.makePairingToken('https://relay-a.workers.dev');
       const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
 
       const pairedB_first = await chB.pair(tokenA);
       const pairedA_first = await chA.pair(tokenB);
-
       expect(pairedA_first.pathId()).toBe(pairedB_first.pathId());
     });
 
@@ -79,21 +84,19 @@ describe('Channel', () => {
       const storB = makeStorage();
       const chA = await Channel.load('nexus-a', storA);
       const chB = await Channel.load('nexus-b', storB);
-
       const staleToken = chB.makePairingToken('https://relay-b.workers.dev');
       staleToken.ts = Math.floor(Date.now() / 1000) - 9999;
-
       await expect(chA.pair(staleToken, 3600)).rejects.toThrow(ChannelPairError);
     });
 
-    it('rejects tokens with invalid pubkey length', async () => {
+    it('rejects tokens with wrong Ed25519 pubkey length', async () => {
       const storA = makeStorage();
       const chA = await Channel.load('nexus-a', storA);
-
       const badToken = {
         v: 1 as const,
         nexus_id: 'nexus-b',
-        pubkey: 'aGVsbG8=',  // "hello" — not 32 bytes
+        pubkey: 'aGVsbG8',  // "hello" — not 32 bytes
+        dh_pubkey: 'aGVsbG8',
         endpoint: 'https://x.workers.dev',
         nonce: 'abc',
         ts: Math.floor(Date.now() / 1000),
@@ -109,58 +112,30 @@ describe('Channel', () => {
       expect(await ch.getPaired('nexus-b')).toBeNull();
     });
 
-    it('returns the PairedChannel after pairing', async () => {
-      const storA = makeStorage();
-      const storB = makeStorage();
-      const chA = await Channel.load('nexus-a', storA);
-      const chB = await Channel.load('nexus-b', storB);
-
-      const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
-      const paired = await chA.pair(tokenB);
+    it('returns a PairedChannel with the same pathId after pairing', async () => {
+      const { chA, pairedA } = await makePairedChannels();
       const reloaded = await chA.getPaired('nexus-b');
-
       expect(reloaded).not.toBeNull();
-      expect(reloaded!.pathId()).toBe(paired.pathId());
+      expect(reloaded!.pathId()).toBe(pairedA.pathId());
     });
   });
 
   describe('revoke()', () => {
     it('removes peer so getPaired returns null', async () => {
-      const storA = makeStorage();
-      const storB = makeStorage();
-      const chA = await Channel.load('nexus-a', storA);
-      const chB = await Channel.load('nexus-b', storB);
-
-      const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
-      await chA.pair(tokenB);
+      const { chA } = await makePairedChannels();
       await chA.revoke('nexus-b');
-
       expect(await chA.getPaired('nexus-b')).toBeNull();
     });
   });
 
   describe('sign() / verify()', () => {
     it('signs and verifies canonical envelope bytes', async () => {
-      const storA = makeStorage();
-      const storB = makeStorage();
-      const chA = await Channel.load('nexus-a', storA);
-      const chB = await Channel.load('nexus-b', storB);
-
-      const tokenA = chA.makePairingToken('https://relay-a.workers.dev');
-      const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
-      const pairedA = await chA.pair(tokenB);
-      const pairedB = await chB.pair(tokenA);
-
+      const { pairedA, pairedB } = await makePairedChannels();
       const envelope = new TextEncoder().encode(JSON.stringify({
-        method: 'POST',
-        path: '/relay/inbound',
-        origin_nexus: 'nexus-a',
-        dest_nexus: 'nexus-b',
+        method: 'POST', path: '/mailbox/nxc_abc',
+        origin_nexus: 'nexus-a', dest_nexus: 'nexus-b',
         msg_id: '01952c00-0000-7000-0000-000000000001',
-        ts: 1713480000,
-        body_sha256: 'abc123',
-        kind: 'proposal',
-        in_reply_to: null,
+        ts: 1713480000, body_sha256: 'abc123', kind: 'proposal', in_reply_to: null,
       }));
 
       const sig = await pairedA.sign(envelope);
@@ -168,37 +143,83 @@ describe('Channel', () => {
     });
 
     it('verify throws on tampered envelope', async () => {
-      const storA = makeStorage();
-      const storB = makeStorage();
-      const chA = await Channel.load('nexus-a', storA);
-      const chB = await Channel.load('nexus-b', storB);
-
-      const tokenA = chA.makePairingToken('https://relay-a.workers.dev');
-      const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
-      const pairedA = await chA.pair(tokenB);
-      const pairedB = await chB.pair(tokenA);
-
-      const envelope = new TextEncoder().encode('{"msg_id":"abc"}');
-      const sig = await pairedA.sign(envelope);
-
-      const tampered = new TextEncoder().encode('{"msg_id":"xyz"}');
-      await expect(pairedB.verify(sig, tampered)).rejects.toThrow(ChannelVerifyError);
+      const { pairedA, pairedB } = await makePairedChannels();
+      const sig = await pairedA.sign(new TextEncoder().encode('{"msg_id":"abc"}'));
+      await expect(
+        pairedB.verify(sig, new TextEncoder().encode('{"msg_id":"xyz"}'))
+      ).rejects.toThrow(ChannelVerifyError);
     });
 
-    it('verify throws on wrong signature', async () => {
-      const storA = makeStorage();
-      const storB = makeStorage();
-      const chA = await Channel.load('nexus-a', storA);
-      const chB = await Channel.load('nexus-b', storB);
+    it('verify throws on bad signature', async () => {
+      const { pairedB } = await makePairedChannels();
+      const badSig = 'A'.repeat(86);
+      await expect(
+        pairedB.verify(badSig, new TextEncoder().encode('hello'))
+      ).rejects.toThrow(ChannelVerifyError);
+    });
+  });
 
-      const tokenA = chA.makePairingToken('https://relay-a.workers.dev');
-      const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
-      await chA.pair(tokenB);
-      const pairedB = await chB.pair(tokenA);
+  describe('encryptBody() / decryptBody()', () => {
+    it('round-trips plaintext through the shared key', async () => {
+      const { pairedA, pairedB } = await makePairedChannels();
+      const plaintext = new TextEncoder().encode('Hello, @keel-nexus — here is the spec proposal.');
+      const ciphertext = await pairedA.encryptBody(plaintext);
+      const recovered  = await pairedB.decryptBody(ciphertext);
+      expect(new TextDecoder().decode(recovered)).toBe('Hello, @keel-nexus — here is the spec proposal.');
+    });
 
-      const data = new TextEncoder().encode('hello');
-      const badSig = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
-      await expect(pairedB.verify(badSig, data)).rejects.toThrow(ChannelVerifyError);
+    it('decryption works in both directions (shared key is symmetric)', async () => {
+      const { pairedA, pairedB } = await makePairedChannels();
+      const msg = new TextEncoder().encode('reply from B');
+      const ct = await pairedB.encryptBody(msg);
+      const pt = await pairedA.decryptBody(ct);
+      expect(new TextDecoder().decode(pt)).toBe('reply from B');
+    });
+
+    it('each encryption produces a different ciphertext (random nonce)', async () => {
+      const { pairedA } = await makePairedChannels();
+      const pt = new TextEncoder().encode('same message');
+      const ct1 = await pairedA.encryptBody(pt);
+      const ct2 = await pairedA.encryptBody(pt);
+      expect(ct1).not.toBe(ct2);
+    });
+
+    it('decryption fails on tampered ciphertext', async () => {
+      const { pairedA, pairedB } = await makePairedChannels();
+      const ct = await pairedA.encryptBody(new TextEncoder().encode('secret'));
+      const blob = Buffer.from(ct.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+      // Flip a byte in the ciphertext region (after 12-byte nonce)
+      blob[15] ^= 0xff;
+      const tampered = blob.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      await expect(pairedB.decryptBody(tampered)).rejects.toThrow(ChannelDecryptError);
+    });
+
+    it('decryption fails when wrong channel tries to decrypt', async () => {
+      const { pairedA } = await makePairedChannels();
+      // Third frame — different shared key
+      const storC = makeStorage();
+      const storA2 = makeStorage();
+      const chC  = await Channel.load('nexus-c', storC);
+      const chA2 = await Channel.load('nexus-a-2', storA2);
+      const tokenC  = chC.makePairingToken('https://relay-c.workers.dev');
+      const tokenA2 = chA2.makePairingToken('https://relay-a2.workers.dev');
+      const pairedC = await chC.pair(tokenA2);
+
+      const ct = await pairedA.encryptBody(new TextEncoder().encode('top secret'));
+      await expect(pairedC.decryptBody(ct)).rejects.toThrow(ChannelDecryptError);
+    });
+
+    it('respects AAD — decryption fails if AAD does not match', async () => {
+      const { pairedA, pairedB } = await makePairedChannels();
+      const aadA = new TextEncoder().encode('envelope-header-bytes');
+      const aadB = new TextEncoder().encode('different-header-bytes');
+      const ct = await pairedA.encryptBody(new TextEncoder().encode('body'), aadA);
+      await expect(pairedB.decryptBody(ct, aadB)).rejects.toThrow(ChannelDecryptError);
+    });
+
+    it('decryptBody throws on input that is too short', async () => {
+      const { pairedB } = await makePairedChannels();
+      await expect(pairedB.decryptBody('YWJj')).rejects.toThrow(ChannelDecryptError);
     });
   });
 });
