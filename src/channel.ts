@@ -1,9 +1,14 @@
 /**
- * Ed25519 + X25519 channel identity for Frame-to-Frame relay.
+ * Ed25519 + ECDH channel identity for Frame-to-Frame relay.
  *
  * Each Frame holds two keypairs:
  *   - Ed25519 (signing/verification) — non-repudiation on outer envelope
- *   - X25519 (ECDH) — derives a shared symmetric key for body encryption
+ *   - ECDH (P-256 or X25519) — derives a shared symmetric key for body encryption
+ *
+ * Algorithm choice: P-256 for FIPS-compliant environments; X25519 for everything else.
+ * Both sides of a pair must use the same DH algorithm — the PairingToken carries
+ * dh_alg so the receiving side knows what to expect. Mismatched algorithms fail fast
+ * at pair() rather than silently producing an incompatible shared key.
  *
  * Pairing exchanges both public keys OOB (single PairingToken blob).
  * PairedChannel holds the derived shared key; bodies are AEAD-encrypted
@@ -12,6 +17,8 @@
  * Storage is injected ({get, put, delete}) — drop in Workers KV or any
  * async k/v. Private key bytes never leave the runtime once imported.
  */
+
+export type DhAlgorithm = 'P-256' | 'X25519';
 
 export interface ChannelStorage {
   get(key: string): Promise<string | null>;
@@ -22,18 +29,20 @@ export interface ChannelStorage {
 export interface PairingToken {
   v: 1;
   nexus_id: string;
-  sig_alg: 'ed25519';  // always ed25519 for TS; present for interchange cross-alg rejection
-  pubkey: string;      // base64url Ed25519 public key (32 bytes) — for sign/verify
-  dh_pubkey: string;   // base64url X25519 public key (32 bytes) — for ECDH
-  endpoint: string;    // https URL of this frame's relay Worker
-  nonce: string;       // base64url 16 random bytes — OOB token replay guard
-  ts: number;          // unix seconds
+  sig_alg: 'ed25519';   // always ed25519; present for interchange cross-alg rejection
+  dh_alg: DhAlgorithm;  // ECDH curve used — both sides must match
+  pubkey: string;        // base64url Ed25519 public key (32 bytes) — for sign/verify
+  dh_pubkey: string;     // base64url ECDH public key (65 bytes P-256 / 32 bytes X25519)
+  endpoint: string;      // https URL of this frame's relay Worker
+  nonce: string;         // base64url 16 random bytes — OOB token replay guard
+  ts: number;            // unix seconds
 }
 
 export interface PeerRecord {
   nexus_id: string;
   pubkey: string;     // base64url Ed25519
-  dh_pubkey: string;  // base64url X25519
+  dh_alg: DhAlgorithm;
+  dh_pubkey: string;  // base64url ECDH pubkey
   endpoint: string;
   path_id: string;    // nxc_<base64url(sha256(sort(ed25519_pubA, ed25519_pubB)))>
   paired_at: number;  // unix seconds
@@ -43,10 +52,17 @@ const PRIVATE_KEY_STORAGE_KEY    = 'casket:channel:private_key';
 const PUBLIC_KEY_STORAGE_KEY     = 'casket:channel:public_key';
 const DH_PRIVATE_KEY_STORAGE_KEY = 'casket:channel:dh_private_key';
 const DH_PUBLIC_KEY_STORAGE_KEY  = 'casket:channel:dh_public_key';
+const DH_ALG_STORAGE_KEY         = 'casket:channel:dh_alg';
 const PEER_KEY_PREFIX            = 'casket:peers:';
 
 const NONCE_SIZE = 12;
 const TAG_SIZE   = 16;
+
+// Expected DH public key byte lengths.
+const DH_PUB_BYTES: Record<DhAlgorithm, number> = {
+  'P-256': 65,   // uncompressed point: 0x04 || 32 || 32
+  'X25519': 32,
+};
 
 function b64uEncode(buf: Uint8Array): string {
   return Buffer.from(buf).toString('base64')
@@ -88,18 +104,44 @@ function randomBytes(n: number): Uint8Array {
   return buf;
 }
 
+function dhKeyParams(alg: DhAlgorithm): AlgorithmIdentifier | EcKeyImportParams {
+  return alg === 'P-256'
+    ? { name: 'ECDH', namedCurve: 'P-256' }
+    : { name: 'X25519' };
+}
+
+async function generateDhKeypair(alg: DhAlgorithm): Promise<CryptoKeyPair> {
+  return crypto.subtle.generateKey(
+    dhKeyParams(alg) as EcKeyGenParams,
+    true,
+    ['deriveBits'],
+  ) as Promise<CryptoKeyPair>;
+}
+
+async function importDhPrivate(alg: DhAlgorithm, jwk: JsonWebKey): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'jwk', jwk, dhKeyParams(alg), false, ['deriveBits'],
+  );
+}
+
+async function importDhPublic(alg: DhAlgorithm, raw: Uint8Array): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'raw', Buffer.from(raw), dhKeyParams(alg), false, [],
+  );
+}
+
 async function deriveSharedKey(
+  alg: DhAlgorithm,
   localDhPrivate: CryptoKey,
   peerDhPubBytes: Uint8Array,
 ): Promise<CryptoKey> {
-  const peerDhPublic = await crypto.subtle.importKey(
-    'raw', Buffer.from(peerDhPubBytes),
-    { name: 'ECDH', namedCurve: 'P-256' }, false, [],
-  );
+  const peerDhPublic = await importDhPublic(alg, peerDhPubBytes);
+  const deriveBitsAlg = alg === 'P-256'
+    ? { name: 'ECDH', public: peerDhPublic }
+    : { name: 'X25519', public: peerDhPublic };
   const rawSecret = await crypto.subtle.deriveBits(
-    { name: 'ECDH', public: peerDhPublic }, localDhPrivate, 256,
+    deriveBitsAlg, localDhPrivate, 256,
   ) as ArrayBuffer;
-  // HKDF over the raw secret to produce a 256-bit AES-GCM key.
   const hkdfKey = await crypto.subtle.importKey('raw', rawSecret, 'HKDF', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
     { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode('nexus-casket-channel-v1') },
@@ -125,6 +167,10 @@ export class ChannelDecryptError extends Error {
 /**
  * A Frame's local identity. One per Nexus instance.
  * Call `Channel.load()` on every cold start.
+ *
+ * @param dhAlgorithm  ECDH curve. 'P-256' for FIPS environments; 'X25519' otherwise.
+ *                     Ignored on reload — the stored algorithm is authoritative.
+ *                     Default: 'P-256'.
  */
 export class Channel {
   private constructor(
@@ -133,39 +179,41 @@ export class Channel {
     private readonly _sigPublicKeyBytes: Uint8Array,
     private readonly dhPrivateKey: CryptoKey,
     private readonly _dhPublicKeyBytes: Uint8Array,
+    private readonly dhAlgorithm: DhAlgorithm,
     private readonly storage: ChannelStorage,
   ) {}
 
-  static async load(nexusId: string, storage: ChannelStorage): Promise<Channel> {
+  static async load(
+    nexusId: string,
+    storage: ChannelStorage,
+    dhAlgorithm: DhAlgorithm = 'P-256',
+  ): Promise<Channel> {
     const storedSigPriv = await storage.get(PRIVATE_KEY_STORAGE_KEY);
     const storedSigPub  = await storage.get(PUBLIC_KEY_STORAGE_KEY);
     const storedDhPriv  = await storage.get(DH_PRIVATE_KEY_STORAGE_KEY);
     const storedDhPub   = await storage.get(DH_PUBLIC_KEY_STORAGE_KEY);
+    const storedDhAlg   = await storage.get(DH_ALG_STORAGE_KEY) as DhAlgorithm | null;
 
-    if (storedSigPriv && storedSigPub && storedDhPriv && storedDhPub) {
+    if (storedSigPriv && storedSigPub && storedDhPriv && storedDhPub && storedDhAlg) {
       const sigPrivateKey = await crypto.subtle.importKey(
         'jwk', JSON.parse(storedSigPriv) as JsonWebKey,
         { name: 'Ed25519' }, false, ['sign'],
       );
-      const dhPrivateKey = await crypto.subtle.importKey(
-        'jwk', JSON.parse(storedDhPriv) as JsonWebKey,
-        { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'],
-      );
+      const dhPrivateKey = await importDhPrivate(storedDhAlg, JSON.parse(storedDhPriv) as JsonWebKey);
       return new Channel(
         nexusId,
         sigPrivateKey, b64uDecode(storedSigPub),
         dhPrivateKey,  b64uDecode(storedDhPub),
+        storedDhAlg,
         storage,
       );
     }
 
-    // First run — generate both keypairs.
+    // First run — generate both keypairs using the requested algorithm.
     const sigKp = await crypto.subtle.generateKey(
       { name: 'Ed25519' }, true, ['sign', 'verify'],
     ) as CryptoKeyPair;
-    const dhKp = await crypto.subtle.generateKey(
-      { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits'],
-    ) as CryptoKeyPair;
+    const dhKp = await generateDhKeypair(dhAlgorithm);
 
     const sigPrivJwk = await crypto.subtle.exportKey('jwk', sigKp.privateKey);
     const sigPubRaw  = new Uint8Array(await crypto.subtle.exportKey('raw', sigKp.publicKey) as ArrayBuffer);
@@ -175,29 +223,30 @@ export class Channel {
     const sigPrivateKey = await crypto.subtle.importKey(
       'jwk', sigPrivJwk, { name: 'Ed25519' }, false, ['sign'],
     );
-    const dhPrivateKey = await crypto.subtle.importKey(
-      'jwk', dhPrivJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'],
-    );
+    const dhPrivateKey = await importDhPrivate(dhAlgorithm, dhPrivJwk);
 
     await storage.put(PRIVATE_KEY_STORAGE_KEY,    JSON.stringify(sigPrivJwk));
     await storage.put(PUBLIC_KEY_STORAGE_KEY,     b64uEncode(sigPubRaw));
     await storage.put(DH_PRIVATE_KEY_STORAGE_KEY, JSON.stringify(dhPrivJwk));
     await storage.put(DH_PUBLIC_KEY_STORAGE_KEY,  b64uEncode(dhPubRaw));
+    await storage.put(DH_ALG_STORAGE_KEY,         dhAlgorithm);
 
-    return new Channel(nexusId, sigPrivateKey, sigPubRaw, dhPrivateKey, dhPubRaw, storage);
+    return new Channel(nexusId, sigPrivateKey, sigPubRaw, dhPrivateKey, dhPubRaw, dhAlgorithm, storage);
   }
 
-  publicKeyBytes(): Uint8Array { return this._sigPublicKeyBytes; }
-  publicKeyB64u(): string      { return b64uEncode(this._sigPublicKeyBytes); }
+  publicKeyBytes(): Uint8Array   { return this._sigPublicKeyBytes; }
+  publicKeyB64u(): string        { return b64uEncode(this._sigPublicKeyBytes); }
   dhPublicKeyBytes(): Uint8Array { return this._dhPublicKeyBytes; }
-  dhPublicKeyB64u(): string    { return b64uEncode(this._dhPublicKeyBytes); }
+  dhPublicKeyB64u(): string      { return b64uEncode(this._dhPublicKeyBytes); }
+  dhAlg(): DhAlgorithm           { return this.dhAlgorithm; }
 
   /** Build a PairingToken to exchange OOB with the peer operator. */
   makePairingToken(endpoint: string): PairingToken {
     return {
       v: 1,
-      nexus_id: this.nexusId,
+      nexus_id:  this.nexusId,
       sig_alg:   'ed25519',
+      dh_alg:    this.dhAlgorithm,
       pubkey:    this.publicKeyB64u(),
       dh_pubkey: this.dhPublicKeyB64u(),
       endpoint,
@@ -209,6 +258,7 @@ export class Channel {
   /**
    * Complete pairing from the peer's PairingToken.
    * Derives the shared AEAD key via ECDH and stores the peer record.
+   * Throws ChannelPairError if the peer's dh_alg doesn't match this Channel's.
    */
   async pair(token: PairingToken, maxAgeSeconds = 86400): Promise<PairedChannel> {
     const age = Math.floor(Date.now() / 1000) - token.ts;
@@ -221,18 +271,28 @@ export class Channel {
       throw new ChannelPairError('Peer Ed25519 public key must be 32 bytes.');
     }
 
+    const peerDhAlg = token.dh_alg ?? 'P-256';  // tolerate tokens from pre-dh_alg casket
+    if (peerDhAlg !== this.dhAlgorithm) {
+      throw new ChannelPairError(
+        `DH algorithm mismatch: local=${this.dhAlgorithm}, peer=${peerDhAlg}. Both sides must use the same curve.`,
+      );
+    }
+
     const peerDhPubBytes = b64uDecode(token.dh_pubkey);
-    // P-256 uncompressed public key = 65 bytes (0x04 + 32 + 32)
-    if (peerDhPubBytes.length !== 65) {
-      throw new ChannelPairError('Peer X25519 (P-256) public key must be 65 bytes.');
+    const expectedDhBytes = DH_PUB_BYTES[peerDhAlg];
+    if (peerDhPubBytes.length !== expectedDhBytes) {
+      throw new ChannelPairError(
+        `Peer ${peerDhAlg} public key must be ${expectedDhBytes} bytes, got ${peerDhPubBytes.length}.`,
+      );
     }
 
     const pathId = await computePathId(this._sigPublicKeyBytes, peerSigPubBytes);
-    const sharedKey = await deriveSharedKey(this.dhPrivateKey, peerDhPubBytes);
+    const sharedKey = await deriveSharedKey(this.dhAlgorithm, this.dhPrivateKey, peerDhPubBytes);
 
     const record: PeerRecord = {
       nexus_id:  token.nexus_id,
       pubkey:    token.pubkey,
+      dh_alg:    peerDhAlg,
       dh_pubkey: token.dh_pubkey,
       endpoint:  token.endpoint,
       path_id:   pathId,
@@ -254,11 +314,12 @@ export class Channel {
 
     const peerSigPubBytes = b64uDecode(record.pubkey);
     const peerDhPubBytes  = b64uDecode(record.dh_pubkey);
+    const peerDhAlg       = record.dh_alg ?? 'P-256';
 
     const peerSigPublicKey = await crypto.subtle.importKey(
       'raw', peerSigPubBytes.buffer as ArrayBuffer, { name: 'Ed25519' }, false, ['verify'],
     );
-    const sharedKey = await deriveSharedKey(this.dhPrivateKey, peerDhPubBytes);
+    const sharedKey = await deriveSharedKey(peerDhAlg, this.dhPrivateKey, peerDhPubBytes);
 
     return new PairedChannel(this.nexusId, this.sigPrivateKey, record, peerSigPublicKey, sharedKey);
   }
@@ -283,8 +344,8 @@ export class PairedChannel {
   ) {}
 
   /** Symmetric path identifier — use as interchange mailbox address / DO name. */
-  pathId(): string    { return this.peer.path_id; }
-  peerId(): string    { return this.peer.nexus_id; }
+  pathId(): string       { return this.peer.path_id; }
+  peerId(): string       { return this.peer.nexus_id; }
   peerEndpoint(): string { return this.peer.endpoint; }
   peerRecord(): Readonly<PeerRecord> { return this.peer; }
 

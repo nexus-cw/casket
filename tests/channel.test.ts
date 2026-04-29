@@ -1,6 +1,6 @@
 import { describe, it, expect } from '@jest/globals';
 import { Channel, ChannelPairError, ChannelVerifyError, ChannelDecryptError } from '../src/channel.js';
-import type { ChannelStorage } from '../src/channel.js';
+import type { ChannelStorage, DhAlgorithm } from '../src/channel.js';
 
 function makeStorage(): ChannelStorage {
   const store = new Map<string, string>();
@@ -11,11 +11,11 @@ function makeStorage(): ChannelStorage {
   };
 }
 
-async function makePairedChannels() {
+async function makePairedChannels(alg: DhAlgorithm = 'P-256') {
   const storA = makeStorage();
   const storB = makeStorage();
-  const chA = await Channel.load('nexus-a', storA);
-  const chB = await Channel.load('nexus-b', storB);
+  const chA = await Channel.load('nexus-a', storA, alg);
+  const chB = await Channel.load('nexus-b', storB, alg);
   const tokenA = chA.makePairingToken('https://relay-a.workers.dev');
   const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
   const pairedA = await chA.pair(tokenB);
@@ -24,7 +24,7 @@ async function makePairedChannels() {
 }
 
 describe('Channel', () => {
-  it('generates Ed25519 and X25519 keypairs on first load', async () => {
+  it('generates Ed25519 and P-256 keypairs on first load (default)', async () => {
     const storage = makeStorage();
     const ch = await Channel.load('nexus-a', storage);
     expect(ch.publicKeyBytes().length).toBe(32);
@@ -32,9 +32,19 @@ describe('Channel', () => {
     // P-256 uncompressed = 65 bytes
     expect(ch.dhPublicKeyBytes().length).toBe(65);
     expect(ch.dhPublicKeyB64u()).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(ch.dhAlg()).toBe('P-256');
   });
 
-  it('reloads the same keypairs from storage', async () => {
+  it('generates X25519 keypair when requested', async () => {
+    const storage = makeStorage();
+    const ch = await Channel.load('nexus-a', storage, 'X25519');
+    expect(ch.publicKeyBytes().length).toBe(32);
+    // X25519 raw public key = 32 bytes
+    expect(ch.dhPublicKeyBytes().length).toBe(32);
+    expect(ch.dhAlg()).toBe('X25519');
+  });
+
+  it('reloads the same keypairs from storage (P-256)', async () => {
     const storage = makeStorage();
     const ch1 = await Channel.load('nexus-a', storage);
     const pub1   = ch1.publicKeyB64u();
@@ -43,20 +53,42 @@ describe('Channel', () => {
     const ch2 = await Channel.load('nexus-a', storage);
     expect(ch2.publicKeyB64u()).toBe(pub1);
     expect(ch2.dhPublicKeyB64u()).toBe(dhPub1);
+    expect(ch2.dhAlg()).toBe('P-256');
   });
 
-  it('makePairingToken includes both pubkeys', async () => {
+  it('reloads the same keypairs from storage (X25519)', async () => {
+    const storage = makeStorage();
+    const ch1 = await Channel.load('nexus-a', storage, 'X25519');
+    const pub1   = ch1.publicKeyB64u();
+    const dhPub1 = ch1.dhPublicKeyB64u();
+
+    // dhAlgorithm arg is ignored on reload — stored alg wins
+    const ch2 = await Channel.load('nexus-a', storage, 'P-256');
+    expect(ch2.publicKeyB64u()).toBe(pub1);
+    expect(ch2.dhPublicKeyB64u()).toBe(dhPub1);
+    expect(ch2.dhAlg()).toBe('X25519');
+  });
+
+  it('makePairingToken includes both pubkeys and dh_alg', async () => {
     const storage = makeStorage();
     const ch = await Channel.load('nexus-a', storage);
     const token = ch.makePairingToken('https://relay-a.workers.dev');
 
     expect(token.v).toBe(1);
     expect(token.nexus_id).toBe('nexus-a');
+    expect(token.sig_alg).toBe('ed25519');
+    expect(token.dh_alg).toBe('P-256');
     expect(token.pubkey).toBe(ch.publicKeyB64u());
     expect(token.dh_pubkey).toBe(ch.dhPublicKeyB64u());
     expect(token.endpoint).toBe('https://relay-a.workers.dev');
     expect(token.nonce.length).toBeGreaterThan(0);
     expect(token.ts).toBeGreaterThan(0);
+  });
+
+  it('makePairingToken carries X25519 dh_alg when channel uses X25519', async () => {
+    const ch = await Channel.load('nexus-a', makeStorage(), 'X25519');
+    const token = ch.makePairingToken('https://relay-a.workers.dev');
+    expect(token.dh_alg).toBe('X25519');
   });
 
   describe('pair()', () => {
@@ -96,6 +128,7 @@ describe('Channel', () => {
         v: 1 as const,
         nexus_id: 'nexus-b',
         sig_alg: 'ed25519' as const,
+        dh_alg: 'P-256' as const,
         pubkey: 'aGVsbG8',  // "hello" — not 32 bytes
         dh_pubkey: 'aGVsbG8',
         endpoint: 'https://x.workers.dev',
@@ -103,6 +136,13 @@ describe('Channel', () => {
         ts: Math.floor(Date.now() / 1000),
       };
       await expect(chA.pair(badToken)).rejects.toThrow(ChannelPairError);
+    });
+
+    it('rejects a token when dh_alg mismatches the local channel', async () => {
+      const chA = await Channel.load('nexus-a', makeStorage(), 'P-256');
+      const chB = await Channel.load('nexus-b', makeStorage(), 'X25519');
+      const tokenB = chB.makePairingToken('https://relay-b.workers.dev');
+      await expect(chA.pair(tokenB)).rejects.toThrow(ChannelPairError);
     });
   });
 
@@ -222,11 +262,13 @@ describe('Channel', () => {
       const { pairedB } = await makePairedChannels();
       await expect(pairedB.decryptBody('YWJj')).rejects.toThrow(ChannelDecryptError);
     });
-  });
 
-  it('makePairingToken includes sig_alg field', async () => {
-    const ch = await Channel.load('nexus-a', makeStorage());
-    const token = ch.makePairingToken('https://relay.workers.dev');
-    expect(token.sig_alg).toBe('ed25519');
+    it('X25519 round-trips plaintext through the shared key', async () => {
+      const { pairedA, pairedB } = await makePairedChannels('X25519');
+      const plaintext = new TextEncoder().encode('Hello via X25519');
+      const ciphertext = await pairedA.encryptBody(plaintext);
+      const recovered  = await pairedB.decryptBody(ciphertext);
+      expect(new TextDecoder().decode(recovered)).toBe('Hello via X25519');
+    });
   });
 });
